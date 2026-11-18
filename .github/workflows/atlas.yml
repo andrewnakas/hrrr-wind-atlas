@@ -1,0 +1,173 @@
+name: Build the wind atlas
+
+# THE SCHEDULE ONLY FIRES FROM THE DEFAULT BRANCH.
+#
+# This repository exists because of that rule. The viewer's own repo carried an
+# hourly cron on a working branch for days and it never fired once — GitHub
+# reads `schedule:` from the workflow file on the DEFAULT branch only, so a cron
+# on any other branch is silently dead. If you branch this repo, the cron keeps
+# running from the default branch's copy, not yours.
+#
+# It is also public on purpose: Actions minutes are unlimited and free for
+# public repositories, and an hourly ~20 minute build is ~14,600 minutes a
+# month, which no private free tier covers. Nothing secret lives here — the
+# pipeline reads NOAA's HRRR anonymously and the only credentials are the R2
+# upload keys, which are repository secrets rather than code.
+on:
+  schedule:
+    # HRRR publishes hourly; :25 leaves room for the run to land and be ingested.
+    - cron: '25 * * * *'
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      leads:
+        description: 'Forecast hours to build'
+        required: false
+        default: '18'
+
+# Never cancel a build in flight. A run that is superseded mid-upload can leave
+# the bucket holding half of one forecast and half of another, and the viewer
+# reads meta.json to decide which leads exist.
+concurrency:
+  group: atlas
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    # A full 18-lead build measures ~20 min. 45 leaves headroom for a slow read
+    # without letting a genuinely stuck run burn an hour.
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      # FAIL here rather than build-and-skip.
+      #
+      # The first version set a flag and let the upload step skip itself, so a
+      # run with an empty secret built for twenty minutes, published nothing,
+      # and reported SUCCESS. A green run that ships no data is worse than a red
+      # one: the whole point of this repo is to publish, so not publishing is a
+      # failure however tidily it was skipped.
+      #
+      # It prints LENGTHS, never values. `gh secret set` reading empty stdin
+      # stores an empty secret and still lists it with a fresh timestamp, so
+      # "the secret exists" proves nothing — a length does. GitHub masks secret
+      # values in logs; a byte count is safe to print and is the only way to
+      # tell an empty secret from a wrong one.
+      - name: Check the R2 credentials are present
+        env:
+          ACCOUNT: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          KEY: ${{ secrets.R2_ACCESS_KEY_ID }}
+          SECRET: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+        run: |
+          echo "CLOUDFLARE_ACCOUNT_ID  ${#ACCOUNT} bytes"
+          echo "R2_ACCESS_KEY_ID       ${#KEY} bytes"
+          echo "R2_SECRET_ACCESS_KEY   ${#SECRET} bytes"
+          missing=""
+          [ -z "$ACCOUNT" ] && missing="$missing CLOUDFLARE_ACCOUNT_ID"
+          [ -z "$KEY" ]     && missing="$missing R2_ACCESS_KEY_ID"
+          [ -z "$SECRET" ]  && missing="$missing R2_SECRET_ACCESS_KEY"
+          if [ -n "$missing" ]; then
+            echo ""
+            echo "EMPTY OR UNSET:${missing}"
+            echo "Set them with:  gh secret set NAME --repo ${{ github.repository }}"
+            echo "and confirm the '✓ Set Actions secret' line appears — a silent"
+            echo "gh secret set has read empty stdin and stored nothing."
+            exit 1
+          fi
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+      - run: pip install -r requirements.txt
+
+      # These are plain scripts, not pytest — they print PASS/FAIL lines and
+      # exit non-zero on failure.
+      #
+      # Only the soaring one runs here. test_agl_interp.py needs a slab of real
+      # HRRR model-level data passed as an argument, which CI has no copy of;
+      # running it without one would fail for the wrong reason. It stays in the
+      # repo because it is the check that pins the ladder to 0.0000 m, and it is
+      # meant to be run by hand against a slab when the interpolation changes.
+      - name: Test the soaring physics
+        run: PYTHONPATH=pipeline python test/test_soaring.py
+
+      - name: Build the atlas
+        run: |
+          PYTHONPATH=pipeline python pipeline/build.py \
+            --out out \
+            --leads "${{ github.event.inputs.leads || 18 }}" \
+            --workers 11
+          du -sh out
+          python -c "import json;m=json.load(open('out/meta.json'));print('init',m['init'],'leads',len(m['leads']))"
+
+      # Guard against a runaway build filling the bucket. The measured size at
+      # 18 leads is ~650 MB.
+      - name: Check the atlas is a sane size
+        run: |
+          mb=$(du -sm out | cut -f1)
+          echo "atlas is ${mb} MB"
+          if [ "$mb" -gt 900 ]; then echo "atlas is larger than the 900 MB guard"; exit 1; fi
+
+      # Via the S3 API rather than wrangler: wrangler can only put ONE object
+      # per invocation and has no sync, which would mean hundreds of CLI
+      # startups. `s3 sync` is one call and genuinely incremental — it compares
+      # size and mtime, so the terrain tiles, which are identical between runs,
+      # are skipped and only the wind actually turns over.
+      - name: Sync to R2
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: auto
+          # R2 computes its own checksums; the CRC32 trailer the newer AWS CLI
+          # adds by default makes it reject the upload.
+          AWS_REQUEST_CHECKSUM_CALCULATION: when_required
+          AWS_RESPONSE_CHECKSUM_VALIDATION: when_required
+          ACCOUNT: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          BUCKET: ${{ vars.R2_BUCKET || 'wind-atlas' }}
+        run: |
+          aws s3 sync out "s3://${BUCKET}" \
+            --endpoint-url "https://${ACCOUNT}.r2.cloudflarestorage.com" \
+            --delete --only-show-errors
+          # meta.json last and short-lived: it names which leads exist, so a
+          # stale copy points the viewer at tiles that are already gone.
+          aws s3 cp out/meta.json "s3://${BUCKET}/meta.json" \
+            --endpoint-url "https://${ACCOUNT}.r2.cloudflarestorage.com" \
+            --cache-control "public, max-age=60" \
+            --content-type application/json --only-show-errors
+
+      # A green upload is not proof it serves. Ask the way the browser asks:
+      # a GET carrying the viewer's Origin, because CORS rules name specific
+      # origins and a probe from anywhere else proves nothing.
+      - name: Verify the atlas serves
+        if: vars.WIND_DATA_URL != ''
+        env:
+          BASE: ${{ vars.WIND_DATA_URL }}
+          ORIGIN: ${{ vars.WIND_SITE_URL }}
+        run: |
+          base="${BASE%/}"
+          for i in $(seq 1 10); do
+            code=$(curl -sS -o /tmp/meta.json -w '%{http_code}' "${base}/meta.json" || true)
+            if [ "$code" = "200" ] && grep -q '"agl"' /tmp/meta.json; then
+              python3 -c "import json;m=json.load(open('/tmp/meta.json'));print('serving init',m['init'],'with',len(m['leads']),'leads')"
+              if [ -n "$ORIGIN" ]; then
+                acao=$(curl -sS -o /dev/null -D - -H "Origin: ${ORIGIN%/}" "${base}/meta.json" \
+                       | tr -d '\r' | grep -i '^access-control-allow-origin:' || true)
+                if [ -z "$acao" ]; then
+                  echo "WARNING: no Access-Control-Allow-Origin for ${ORIGIN}."
+                  echo "The atlas is published, but the viewer's fetches will fail"
+                  echo "in the browser. Add that origin to the bucket's CORS rule."
+                else
+                  echo "CORS ok: $acao"
+                fi
+              fi
+              exit 0
+            fi
+            echo "attempt $i: HTTP $code, retrying"
+            sleep 12
+          done
+          echo "atlas did not come up at ${base}"
+          exit 1
+# Schedule re-registered 2026-11-18 after GitHub disabled it for inactivity.
