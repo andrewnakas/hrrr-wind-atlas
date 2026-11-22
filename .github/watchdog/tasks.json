@@ -1,0 +1,6 @@
+{
+  "_about": "The task's cron is copied from atlas.yml's schedule; change both together. grace is how many minutes after the slot to wait for GitHub's own run before dispatching one.",
+  "tasks": [
+    {"workflow": "atlas.yml", "cron": "25 * * * *", "grace": 30}
+  ]
+}
