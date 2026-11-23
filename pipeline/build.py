@@ -155,7 +155,7 @@ def main():
 
     t0 = time.time()
     sfc, ml = open_groups()
-    init = pick_init(ml, args.init)
+    init = pick_init(ml, sfc, args.leads, args.init)
     lead_values = ml.lead_time.values[: args.leads]
     log.info("init %s, %d leads", init, len(lead_values))
 

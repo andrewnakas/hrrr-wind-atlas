@@ -86,13 +86,16 @@ jobs:
       # These are plain scripts, not pytest — they print PASS/FAIL lines and
       # exit non-zero on failure.
       #
-      # Only the soaring one runs here. test_agl_interp.py needs a slab of real
+      # The soaring and init-picker tests run here. test_agl_interp.py needs a slab of real
       # HRRR model-level data passed as an argument, which CI has no copy of;
       # running it without one would fail for the wrong reason. It stays in the
       # repo because it is the check that pins the ladder to 0.0000 m, and it is
       # meant to be run by hand against a slab when the interpolation changes.
       - name: Test the soaring physics
         run: PYTHONPATH=pipeline python test/test_soaring.py
+
+      - name: Test the init picker
+        run: PYTHONPATH=pipeline python test/test_init_picker.py
 
       - name: Build the atlas
         run: |

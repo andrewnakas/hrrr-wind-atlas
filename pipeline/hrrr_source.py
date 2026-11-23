@@ -71,23 +71,30 @@ def open_groups(dataset_id: str = DATASET_ID):
     return sfc, ml
 
 
-def pick_init(ml, requested: str | None = None, max_steps_back: int = 4):
-    """Choose an init_time whose final lead is actually readable.
+def pick_init(ml, sfc, leads, requested: str | None = None, max_steps_back: int = 4):
+    """Choose an init_time whose every lead the build reads is in, in both groups.
 
     The dataset lists an init as soon as ingest starts, so the newest one is
     routinely all-NaN — 2026-08-10T17:00Z was empty while 16:00Z was complete.
-    Probe the last lead and step back an hour at a time.
+    Probe, and step back an hour at a time.
+
+    Probing only the model-level wind at the dataset's final lead was not
+    enough. Twice (2026-11-18 18Z, 2026-11-23 00Z) an init passed that probe,
+    the build read all 18 leads, and then failed at the very end with
+    "stability field is entirely NaN". Boundary-layer height is a surface-group
+    field, and the final lead is not one the build reads, so the probe now
+    covers every lead the build will read, in both groups.
     """
     if requested and requested != "auto":
         init = np.datetime64(requested)
-        _probe(ml, init)
+        _probe(ml, sfc, init, leads)
         return init
 
     inits = ml.init_time.values
     for i in range(1, max_steps_back + 2):
         init = inits[-i]
         try:
-            _probe(ml, init)
+            _probe(ml, sfc, init, leads)
             log.info("using init %s", init)
             return init
         except Exception as exc:  # noqa: BLE001 - any read failure means incomplete
@@ -95,12 +102,18 @@ def pick_init(ml, requested: str | None = None, max_steps_back: int = 4):
     raise RuntimeError(f"no complete init in the last {max_steps_back + 1} cycles")
 
 
-def _probe(ml, init):
+def _probe(ml, sfc, init, leads):
+    """Raise unless a small window is readable at every lead, in both groups."""
     ys, xs = PROBE_WINDOW
-    slab = (
-        ml.wind_u.sel(init_time=init)
-        .isel(lead_time=-1, y=slice(*ys), x=slice(*xs), model_level=0)
-        .values
-    )
-    if np.isnan(slab).all():
-        raise ValueError("probe slice is all-NaN (ingest incomplete)")
+    window = {"lead_time": slice(0, leads), "y": slice(*ys), "x": slice(*xs)}
+    fields = {
+        "model-level wind": ml.wind_u.sel(init_time=init).isel(model_level=0, **window),
+        "boundary-layer height": sfc.planetary_boundary_layer_height_surface
+        .sel(init_time=init).isel(**window),
+    }
+    for what, field in fields.items():
+        slab = field.transpose("lead_time", ...).values
+        empty = np.isnan(slab.reshape(slab.shape[0], -1)).all(axis=1)
+        if empty.any():
+            raise ValueError(f"{what} is all-NaN at lead index "
+                             f"{np.flatnonzero(empty).tolist()} (ingest incomplete)")
